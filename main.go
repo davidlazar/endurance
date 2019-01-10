@@ -311,11 +311,12 @@ type SummaryActivity struct {
 
 func (s *SummaryActivity) MsgFormat() string {
 	miles := s.Distance / 1609.34 // meters in a mile
+	elapsedTime := calcTime(s.ElapsedTime)
 	racePace := calcPace(miles, float64(s.ElapsedTime))
 	movingPace := calcPace(miles, float64(s.MovingTime))
 
 	pause := time.Duration(time.Duration(s.ElapsedTime-s.MovingTime) * time.Second)
-	return fmt.Sprintf("%s %0.1fmi at %s pace (%s without %s of pause time)", activityPastTense(s.Type), miles, racePace, movingPace, pause)
+	return fmt.Sprintf("%s %0.1fmi in %s (%s pace, %s without %s of pause time)", activityPastTense(s.Type), miles, elapsedTime, racePace, movingPace, pause)
 }
 
 func (s *Server) getActivity(user *StravaUser, activityID int) (*SummaryActivity, error) {
@@ -406,6 +407,17 @@ func (s *Server) alertAdmin(format string, v ...interface{}) {
 		msg := s.slackRTM.NewOutgoingMessage(str, s.slackAdminChannel)
 		s.slackRTM.SendMessage(msg)
 	}()
+}
+
+func calcTime(totalSeconds int) string {
+	seconds := totalSeconds % 60
+	minutes := (totalSeconds / 60) % 60
+	hours := totalSeconds / (60 * 60)
+	if hours == 0 {
+		return fmt.Sprintf("%d:%02d", minutes, seconds)
+	} else {
+		return fmt.Sprintf("%d:%02d:%02d", hours, minutes, seconds)
+	}
 }
 
 func calcPace(miles float64, seconds float64) string {
