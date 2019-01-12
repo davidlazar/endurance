@@ -113,11 +113,17 @@ func main() {
 		Handler:   mux,
 		TLSConfig: certManager.TLSConfig(),
 	}
-	go httpServer.ListenAndServeTLS("", "")
+	go func() {
+		err := httpServer.ListenAndServeTLS("", "")
+		log.Fatal(err)
+	}()
 
-	go http.ListenAndServe(":http", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		http.Redirect(w, req, "https://"+req.Host+req.URL.String(), http.StatusMovedPermanently)
-	}))
+	go func() {
+		err := http.ListenAndServe(":http", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			http.Redirect(w, req, "https://"+req.Host+req.URL.String(), http.StatusMovedPermanently)
+		}))
+		log.Fatal(err)
+	}()
 
 	s.loadUsers()
 	s.subscribeWebhook()
