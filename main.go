@@ -71,8 +71,10 @@ func main() {
 		log.Fatalf("invalid config file (some fields missing)")
 	}
 
-	logger := log.New(os.Stdout, "slack-bot: ", log.Lshortfile|log.LstdFlags)
-	api := slack.New(conf.SlackAPIToken, slack.OptionDebug(false), slack.OptionLog(logger))
+	slackLogFile := logFile("slack.log")
+	defer slackLogFile.Close()
+	slackLog := log.New(slackLogFile, "", log.Lshortfile|log.LstdFlags)
+	api := slack.New(conf.SlackAPIToken, slack.OptionDebug(true), slack.OptionLog(slackLog))
 
 	rtm := api.NewRTM()
 	go rtm.ManageConnection()
@@ -108,10 +110,13 @@ func main() {
 		Prompt:     autocert.AcceptTOS,
 		HostPolicy: autocert.HostWhitelist(conf.Hostname),
 	}
+	httpErrorsFile := logFile("http_errors.log")
+	defer httpErrorsFile.Close()
 	httpServer := &http.Server{
 		Addr:      ":https",
 		Handler:   mux,
 		TLSConfig: certManager.TLSConfig(),
+		ErrorLog:  log.New(httpErrorsFile, "", log.LstdFlags),
 	}
 	go func() {
 		err := httpServer.ListenAndServeTLS("", "")
@@ -129,8 +134,19 @@ func main() {
 	s.subscribeWebhook()
 
 	for msg := range rtm.IncomingEvents {
-		_ = msg
+		switch ev := msg.Data.(type) {
+		case *slack.RTMError:
+			log.Printf("slack error: %s\n", ev.Error())
+		}
 	}
+}
+
+func logFile(name string) *os.File {
+	f, err := os.OpenFile(filepath.Join(*persistDir, name), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return f
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
