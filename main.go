@@ -297,7 +297,7 @@ func (s *Server) stravaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if event.ObjectType == "activity" && event.AspectType == "create" {
+	if event.ObjectType == "activity" && (event.AspectType == "create" || event.AspectType == "update") {
 		go func() {
 			v, ok := s.stravaUsers.Load(event.OwnerID)
 			if !ok {
