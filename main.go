@@ -133,6 +133,8 @@ func main() {
 	s.loadUsers()
 	s.subscribeWebhook()
 
+	go s.weatherLoop()
+
 	for msg := range rtm.IncomingEvents {
 		switch ev := msg.Data.(type) {
 		case *slack.RTMError:
