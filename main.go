@@ -7,9 +7,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/gob"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html/template"
 	"io/ioutil"
 	"log"
 	"math"
@@ -17,12 +19,15 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sync"
+	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/oauth2"
 
+	"github.com/dchest/safefile"
+	"github.com/gorilla/sessions"
 	"github.com/nlopes/slack"
 )
 
@@ -30,16 +35,13 @@ var persistDir = flag.String("persist", "persist", "persistent data directory")
 var apiRoot = "https://www.strava.com/api/v3"
 
 type Server struct {
-	hostname string
-
-	stravaConf  *oauth2.Config
-	stravaUsers sync.Map // map[id]*StravaUser
-
-	slackRTM          *slack.RTM
-	slackChannel      string
-	slackAdminChannel string
-
+	hostname       string
+	stravaConf     *oauth2.Config
 	subscribeToken string
+
+	workspaces map[string]*SlackWorkspace
+
+	alertAdmin func(format string, v ...interface{})
 }
 
 type Config struct {
@@ -48,9 +50,26 @@ type Config struct {
 	StravaClientID     string
 	StravaClientSecret string
 
-	SlackAPIToken       string
-	SlackChannelID      string
-	SlackAdminChannelID string
+	SlackWorkspaces map[string]*SlackWorkspace
+}
+
+type SlackWorkspace struct {
+	APIToken         string
+	AdminChannelID   string
+	RunningChannelID string
+	WeatherChannelID string
+
+	rtm *slack.RTM
+}
+
+var store *sessions.CookieStore
+
+func init() {
+	gob.Register(&oauth2.Token{})
+
+	key := make([]byte, 32)
+	rand.Read(key)
+	store = sessions.NewCookieStore(key)
 }
 
 func main() {
@@ -67,17 +86,9 @@ func main() {
 	if err := json.Unmarshal(confData, conf); err != nil {
 		log.Fatalf("error parsing config.json: %s", err)
 	}
-	if conf.Hostname == "" || conf.StravaClientID == "" || conf.StravaClientSecret == "" || conf.SlackAPIToken == "" || conf.SlackChannelID == "" || conf.SlackAdminChannelID == "" {
+	if conf.Hostname == "" || conf.StravaClientID == "" || conf.StravaClientSecret == "" || len(conf.SlackWorkspaces) == 0 {
 		log.Fatalf("invalid config file (some fields missing)")
 	}
-
-	slackLogFile := logFile("slack.log")
-	defer slackLogFile.Close()
-	slackLog := log.New(slackLogFile, "", log.Lshortfile|log.LstdFlags)
-	api := slack.New(conf.SlackAPIToken, slack.OptionDebug(true), slack.OptionLog(slackLog))
-
-	rtm := api.NewRTM()
-	go rtm.ManageConnection()
 
 	s := &Server{
 		hostname: conf.Hostname,
@@ -93,16 +104,39 @@ func main() {
 			RedirectURL: "https://" + conf.Hostname + "/strava/oauth",
 		},
 
-		slackRTM:          rtm,
-		slackChannel:      conf.SlackChannelID,
-		slackAdminChannel: conf.SlackAdminChannelID,
-		subscribeToken:    randomString(),
+		subscribeToken: randomString(),
+
+		workspaces: conf.SlackWorkspaces,
+		alertAdmin: func(format string, v ...interface{}) { log.Printf(format, v...) },
+	}
+
+	for name, ws := range conf.SlackWorkspaces {
+		logFile := logFile(fmt.Sprintf("slack-%s.log", name))
+		defer logFile.Close()
+		slackLog := log.New(logFile, "", log.Lshortfile|log.LstdFlags)
+
+		api := slack.New(ws.APIToken, slack.OptionDebug(true), slack.OptionLog(slackLog))
+		ws.rtm = api.NewRTM()
+		go ws.rtm.ManageConnection()
+		go s.messageLoop(name, ws)
+
+		if ws.AdminChannelID != "" {
+			ws := ws
+			// Send admin alerts to only one channel.
+			s.alertAdmin = func(format string, v ...interface{}) {
+				str := fmt.Sprintf(format, v...)
+				log.Println(str)
+				msg := ws.rtm.NewOutgoingMessage(str, ws.AdminChannelID)
+				ws.rtm.SendMessage(msg)
+			}
+		}
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", rootHandler)
 	mux.HandleFunc("/strava/oauth", s.stravaOAuthHandler)
 	mux.HandleFunc("/strava/follow", s.stravaFollowHandler)
+	mux.HandleFunc("/strava/user", s.stravaUserHandler)
 	mux.HandleFunc("/strava/webhook", s.stravaWebhookHandler)
 
 	certManager := &autocert.Manager{
@@ -135,8 +169,18 @@ func main() {
 
 	go s.weatherLoop()
 
-	for msg := range rtm.IncomingEvents {
+	select {}
+}
+
+func (s *Server) messageLoop(name string, ws *SlackWorkspace) {
+	for msg := range ws.rtm.IncomingEvents {
 		switch ev := msg.Data.(type) {
+		case *slack.MessageEvent:
+			if ev.Text == "!follow" {
+				text := fmt.Sprintf("https://%s/strava/follow?workspace=%s", s.hostname, name)
+				msg := ws.rtm.NewOutgoingMessage(text, ev.Channel)
+				ws.rtm.SendMessage(msg)
+			}
 		case *slack.RTMError:
 			log.Printf("slack error: %s\n", ev.Error())
 		}
@@ -152,43 +196,38 @@ func logFile(name string) *os.File {
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte(`<html>Endurance Bot!
-	<a href="/strava/follow">Authorize</a> Endurance to follow your runs on Strava.</html>`))
-}
-
-func getOAuthState(w http.ResponseWriter, r *http.Request) (string, bool) {
-	// Unclear if this is a great idea.
-	st, err := r.TLS.ExportKeyingMaterial("oauth-state", nil, 16)
-	if err != nil {
-		http.Error(w, "failed to extract oauth state: "+err.Error(), http.StatusBadRequest)
-		return "", false
-	}
-	state := base64.RawURLEncoding.EncodeToString(st)
-	return state, true
+	w.Write([]byte(`<html><a href="https://github.com/davidlazar/endurance">Endurance</a> Bot!</html>`))
 }
 
 func (s *Server) stravaFollowHandler(w http.ResponseWriter, r *http.Request) {
-	state, ok := getOAuthState(w, r)
+	workspace := r.URL.Query().Get("workspace")
+	_, ok := s.workspaces[workspace]
 	if !ok {
+		http.Error(w, fmt.Sprintf("unknown slack workspace: %q", workspace), http.StatusBadRequest)
 		return
 	}
 
-	authURL := s.stravaConf.AuthCodeURL(state, oauth2.AccessTypeOffline)
+	session, _ := store.Get(r, "strava")
+	oauthState := randomString()
+	session.Values["oauth-state"] = oauthState
+	session.Values["workspace"] = workspace
+	session.Save(r, w)
+
+	authURL := s.stravaConf.AuthCodeURL(oauthState, oauth2.AccessTypeOffline)
+
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
 func (s *Server) stravaOAuthHandler(w http.ResponseWriter, r *http.Request) {
-	state, ok := getOAuthState(w, r)
-	if !ok {
-		return
-	}
-	if state != r.FormValue("state") {
-		http.Error(w, "bad state value: "+r.FormValue("state"), http.StatusBadRequest)
+	session, _ := store.Get(r, "strava")
+
+	if r.FormValue("state") != session.Values["oauth-state"] {
+		http.Error(w, "invalid oauth state value (are cookies enabled?)", http.StatusBadRequest)
 		return
 	}
 
 	code := r.FormValue("code")
-	tok, err := s.stravaConf.Exchange(context.Background(), code)
+	token, err := s.stravaConf.Exchange(context.Background(), code)
 	if err != nil {
 		err = fmt.Errorf("oauth exchange error: %s", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -196,43 +235,160 @@ func (s *Server) stravaOAuthHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.loadAthlete(tok)
+	session.Values["stravaToken"] = token
+	err = session.Save(r, w)
 	if err != nil {
-		err = fmt.Errorf("failed to load strava athlete from oauth token: %s", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		s.alertAdmin(err.Error())
+		http.Error(w, fmt.Sprintf("error saving session: %s", err), http.StatusInternalServerError)
+		return
 	}
 
-	// Persist the OAuth token.
-	tokenJSON, err := json.MarshalIndent(tok, "", "  ")
+	http.Redirect(w, r, "/strava/user", http.StatusFound)
+}
+
+type StravaUser struct {
+	ID    int
+	Name  string
+	Token *oauth2.Token
+
+	SlackWorkspaces []string
+}
+
+func (s *Server) loadStravaUser(id int) (*StravaUser, error) {
+	path := filepath.Join(*persistDir, "users", fmt.Sprintf("%d.strava", id))
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	u := new(StravaUser)
+	err = json.Unmarshal(data, u)
+	if err != nil {
+		return nil, err
+	}
+
+	return u, nil
+}
+
+func (u *StravaUser) Save() error {
+	path := filepath.Join(*persistDir, "users", fmt.Sprintf("%d.strava", u.ID))
+	data, err := json.MarshalIndent(u, "", "  ")
 	if err != nil {
 		panic(err)
 	}
-	path := filepath.Join(*persistDir, "users", fmt.Sprintf("%d.token", user.ID))
-	err = ioutil.WriteFile(path, tokenJSON, 0600)
+	return safefile.WriteFile(path, data, 0660)
+}
+
+type templateData struct {
+	ID         int
+	Name       string
+	Workspaces map[string]bool
+	Message    string
+}
+
+var userTemplate = template.Must(template.New("user").Parse(`<!doctype html>
+<html>
+<head>
+  <link rel='stylesheet' href='https://cdn.jsdelivr.net/gh/kognise/water.css@latest/dist/light.min.css'>
+</head>
+<body>
+<h1>Strava User Settings</h1>
+<form action="/strava/user" method="post">
+  <label>Strava ID: <input type="text" value="{{.ID}}" readonly></label><br>
+  <label>Name: <input type="text" value="{{.Name}}" readonly></label><br>
+  <fieldset>
+    <legend>Post runs to these Slacks:</legend>
+	{{range $name, $checked := .Workspaces}}
+	<label><input name="workspaces" value="{{$name}}" type="checkbox"{{if $checked}}checked{{end}}> {{$name}}</label>
+	{{end}}
+  </fieldset><br>
+  <button type="submit">Save</button>
+</form>
+<br><br>
+<p>{{.Message}}</p>
+</body>
+</html>`))
+
+func (s *Server) stravaUserHandler(w http.ResponseWriter, r *http.Request) {
+	session, _ := store.Get(r, "strava")
+	v, ok := session.Values["stravaToken"]
+	if !ok {
+		http.Error(w, "not logged in!", http.StatusBadRequest)
+		return
+	}
+	token := v.(*oauth2.Token)
+
+	athlete, err := s.getAthlete(token)
 	if err != nil {
-		err = fmt.Errorf("failed to persist oauth token: %s", err)
+		err = fmt.Errorf("failed to get strava athlete info from oauth token: %s", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		s.alertAdmin(err.Error())
+		return
+	}
+	td := templateData{
+		ID:         athlete.ID,
+		Name:       athlete.FirstName,
+		Workspaces: make(map[string]bool),
+	}
+	for k := range s.workspaces {
+		td.Workspaces[k] = false
 	}
 
-	msg := fmt.Sprintf("Strava user %s (%d) is now connected to Endurance. Keep running!", user.Name, user.ID)
-	w.Write([]byte(msg))
-	s.alertAdmin("New Strava user: %s (%d)", user.Name, user.ID)
+	if r.Method == "GET" {
+		u, err := s.loadStravaUser(athlete.ID)
+		if err == nil {
+			for _, name := range u.SlackWorkspaces {
+				td.Workspaces[name] = true
+			}
+		}
+		if name, ok := session.Values["workspace"]; ok {
+			td.Workspaces[name.(string)] = true
+		}
+	} else if r.Method == "POST" {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, fmt.Sprintf("failed to parse form: %s", err), http.StatusInternalServerError)
+			return
+		}
+		names := r.Form["workspaces"]
+		for _, name := range names {
+			_, ok := s.workspaces[name]
+			if !ok {
+				td.Message = fmt.Sprintf("Unknown workspace: %q", name)
+				goto Done
+			}
+			td.Workspaces[name] = true
+		}
+		u := &StravaUser{
+			ID:              athlete.ID,
+			Name:            athlete.FirstName,
+			Token:           token,
+			SlackWorkspaces: names,
+		}
+		err := u.Save()
+		if err != nil {
+			errmsg := fmt.Sprintf("Error saving user state: %s", err)
+			td.Message = errmsg
+			log.Println(errmsg)
+		} else {
+			td.Message = fmt.Sprintf("Saved settings for user %d", athlete.ID)
+			s.alertAdmin("Updated Strava user settings for %s (%d): %v", u.Name, u.ID, u.SlackWorkspaces)
+		}
+	}
+
+Done:
+	err = userTemplate.Execute(w, td)
+	if err != nil {
+		panic(err)
+	}
 }
 
 type DetailedAthlete struct {
 	ID        int    `json:"id"`
 	FirstName string `json:"firstname"`
+
+	client *http.Client
 }
 
-type StravaUser struct {
-	ID     int
-	Name   string
-	Client *http.Client
-}
-
-func (s *Server) loadAthlete(token *oauth2.Token) (*StravaUser, error) {
+func (s *Server) getAthlete(token *oauth2.Token) (*DetailedAthlete, error) {
 	client := s.stravaConf.Client(context.Background(), token)
 
 	resp, err := client.Get(apiRoot + "/athlete")
@@ -252,18 +408,13 @@ func (s *Server) loadAthlete(token *oauth2.Token) (*StravaUser, error) {
 	// TODO handle http.StatusUnauthorized (especially when loading users at startup)
 
 	v := new(DetailedAthlete)
-	err = json.Unmarshal(data, &v)
+	err = json.Unmarshal(data, v)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal detailed athlete: %s: %s", err, data)
 	}
+	v.client = client
 
-	user := &StravaUser{
-		ID:     v.ID,
-		Name:   v.FirstName,
-		Client: client,
-	}
-	s.stravaUsers.Store(v.ID, user)
-	return user, nil
+	return v, nil
 }
 
 type WebhookEvent struct {
@@ -298,26 +449,37 @@ func (s *Server) stravaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		s.alertAdmin("failed to unmarshal webhook event: %s: %s", err, data)
 		return
 	}
+	log.Printf("strava webhook event: %#v", event)
 
 	if event.ObjectType == "activity" && (event.AspectType == "create" || event.AspectType == "update") {
 		go func() {
-			v, ok := s.stravaUsers.Load(event.OwnerID)
-			if !ok {
-				s.alertAdmin("received event for unregistered user %d", event.OwnerID)
+			u, err := s.loadStravaUser(event.OwnerID)
+			if err != nil {
+				s.alertAdmin("failed to load user state for user id %d: %s", event.OwnerID, err)
 				return
 			}
-			user := v.(*StravaUser)
 
-			activity, err := s.getActivity(user, event.ObjectID)
+			athlete, err := s.getAthlete(u.Token)
+			if err != nil {
+				s.alertAdmin("failed to get athlete info for user id %d: %s", event.OwnerID, err)
+				return
+			}
+
+			activity, err := getActivity(athlete.client, event.ObjectID)
 			if err != nil {
 				s.alertAdmin("failed to get activity %d (user %d): %s", event.ObjectID, event.OwnerID, err)
 				return
 			}
 
-			msg := fmt.Sprintf("*%s* %s", user.Name, activity.MsgFormat())
-			log.Printf("Announce: %s", msg)
-			out := s.slackRTM.NewOutgoingMessage(msg, s.slackChannel)
-			s.slackRTM.SendMessage(out)
+			msg := fmt.Sprintf("*%s* %s", athlete.FirstName, activity.MsgFormat())
+			for _, name := range u.SlackWorkspaces {
+				ws, ok := s.workspaces[name]
+				if !ok {
+					continue
+				}
+				out := ws.rtm.NewOutgoingMessage(msg, ws.RunningChannelID)
+				ws.rtm.SendMessage(out)
+			}
 		}()
 	}
 
@@ -343,9 +505,9 @@ func (s *SummaryActivity) MsgFormat() string {
 	return fmt.Sprintf("%s %0.1fmi in %s (%s pace, %s without %s of pause time)", activityPastTense(s.Type), miles, elapsedTime, racePace, movingPace, pause)
 }
 
-func (s *Server) getActivity(user *StravaUser, activityID int) (*SummaryActivity, error) {
+func getActivity(client *http.Client, activityID int) (*SummaryActivity, error) {
 	url := fmt.Sprintf("%s/activities/%d", apiRoot, activityID)
-	resp, err := user.Client.Get(url)
+	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
 	}
@@ -400,37 +562,32 @@ func (s *Server) loadUsers() {
 		log.Fatal(err)
 	}
 
-	files, err := filepath.Glob(filepath.Join(usersPath, "*.token"))
+	files, err := filepath.Glob(filepath.Join(usersPath, "*.strava"))
 	if err != nil {
 		log.Fatal(err)
 	}
+	ids := make([]int, len(files))
+	for i, file := range files {
+		s := strings.TrimSuffix(filepath.Base(file), ".strava")
+		id, err := strconv.Atoi(s)
+		if err != nil {
+			log.Fatalf("invalid user state: %s: %s", file, err)
+		}
+		ids[i] = id
+	}
 
-	for _, file := range files {
-		data, err := ioutil.ReadFile(file)
+	for _, id := range ids {
+		u, err := s.loadStravaUser(id)
 		if err != nil {
 			log.Fatal(err)
 		}
-		token := new(oauth2.Token)
-		err = json.Unmarshal(data, token)
+		athlete, err := s.getAthlete(u.Token)
 		if err != nil {
-			log.Fatalf("failed to unmarshal token from %s: %s", file, err)
-		}
-		user, err := s.loadAthlete(token)
-		if err != nil {
-			log.Printf("failed to load athlete from %s: %s", file, err)
+			log.Printf("failed to load athlete %d: %s", id, err)
 			continue
 		}
-		log.Printf("Loaded user: %s (%d)", user.Name, user.ID)
+		log.Printf("Loaded user: %s (%d)", athlete.FirstName, athlete.ID)
 	}
-}
-
-func (s *Server) alertAdmin(format string, v ...interface{}) {
-	str := fmt.Sprintf(format, v...)
-	log.Println(str)
-	go func() {
-		msg := s.slackRTM.NewOutgoingMessage(str, s.slackAdminChannel)
-		s.slackRTM.SendMessage(msg)
-	}()
 }
 
 func calcTime(totalSeconds int) string {

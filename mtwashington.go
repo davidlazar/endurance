@@ -103,8 +103,13 @@ func (s *Server) weatherLoop() {
 		goodDays := outlook.goodDays()
 		for _, forecast := range goodDays {
 			msg := fmt.Sprintf("Higher summits forecast for %s is looking good! Wind: %s", forecast.Period, forecast.Prediction.Wind)
-			out := s.slackRTM.NewOutgoingMessage(msg, s.slackChannel)
-			s.slackRTM.SendMessage(out)
+			for _, ws := range s.workspaces {
+				if ws.WeatherChannelID == "" {
+					continue
+				}
+				out := ws.rtm.NewOutgoingMessage(msg, ws.WeatherChannelID)
+				ws.rtm.SendMessage(out)
+			}
 		}
 
 		time.Sleep(12 * time.Hour)
