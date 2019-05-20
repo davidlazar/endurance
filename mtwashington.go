@@ -50,7 +50,7 @@ func (p prediction) windNums() []int {
 
 func (p prediction) isGood() bool {
 	for _, wind := range p.windNums() {
-		if wind > 40 {
+		if wind > 30 {
 			return false
 		}
 	}
