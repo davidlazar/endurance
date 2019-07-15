@@ -619,7 +619,7 @@ func activityPastTense(activityType string) string {
 	case "Hike":
 		return "hiked"
 	case "Ride":
-		return "rode"
+		return "biked"
 	case "Walk":
 		return "walked"
 	case "Swim":
