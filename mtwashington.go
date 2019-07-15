@@ -50,7 +50,7 @@ func (p prediction) windNums() []int {
 
 func (p prediction) isGood() bool {
 	for _, wind := range p.windNums() {
-		if wind > 30 {
+		if wind > 15 {
 			return false
 		}
 	}
@@ -112,6 +112,6 @@ func (s *Server) weatherLoop() {
 			}
 		}
 
-		time.Sleep(12 * time.Hour)
+		time.Sleep(24 * time.Hour)
 	}
 }
