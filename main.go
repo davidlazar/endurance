@@ -471,7 +471,10 @@ func (s *Server) stravaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			msg := fmt.Sprintf("*%s* %s", athlete.FirstName, activity.MsgFormat())
+			msg := activity.MsgFormat(athlete.FirstName)
+			if event.AspectType != "create" {
+				msg = msg + "  _(" + event.AspectType + ")_"
+			}
 			for _, name := range u.SlackWorkspaces {
 				ws, ok := s.workspaces[name]
 				if !ok {
@@ -489,20 +492,21 @@ func (s *Server) stravaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 type SummaryActivity struct {
 	ID          int       `json:"id"`
 	Type        string    `json:"type"`
+	Name        string    `json:"name"`
 	StartDate   time.Time `json:"start_date"`
 	Distance    float64   `json:"distance"`
 	MovingTime  int       `json:"moving_time"`
 	ElapsedTime int       `json:"elapsed_time"`
 }
 
-func (s *SummaryActivity) MsgFormat() string {
+func (s *SummaryActivity) MsgFormat(user string) string {
 	miles := s.Distance / 1609.34 // meters in a mile
 	elapsedTime := calcTime(s.ElapsedTime)
 	racePace := calcPace(miles, float64(s.ElapsedTime))
 	movingPace := calcPace(miles, float64(s.MovingTime))
 
 	pause := time.Duration(time.Duration(s.ElapsedTime-s.MovingTime) * time.Second)
-	return fmt.Sprintf("%s %0.1fmi in %s (%s pace, %s without %s of pause time)", activityPastTense(s.Type), miles, elapsedTime, racePace, movingPace, pause)
+	return fmt.Sprintf("*%s* %s *%s*: %0.1fmi in %s (%s pace, %s without %s of pause time)", user, emoji(s.Type), s.Name, miles, elapsedTime, racePace, movingPace, pause)
 }
 
 func getActivity(client *http.Client, activityID int) (*SummaryActivity, error) {
@@ -612,20 +616,20 @@ func calcPace(miles float64, seconds float64) string {
 	return str
 }
 
-func activityPastTense(activityType string) string {
+func emoji(activityType string) string {
 	switch activityType {
 	case "Run":
-		return "ran"
+		return "🏃"
 	case "Hike":
-		return "hiked"
+		return "️⛰️"
 	case "Ride":
-		return "biked"
+		return "🚴"
 	case "Walk":
-		return "walked"
+		return "🚶"
 	case "Swim":
-		return "swam"
+		return "🏊"
 	}
-	return activityType
+	return "🤸" + activityType
 }
 
 func randomString() string {
