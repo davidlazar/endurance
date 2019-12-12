@@ -574,6 +574,7 @@ type SummaryActivity struct {
 	Distance    float64   `json:"distance"`
 	MovingTime  int       `json:"moving_time"`
 	ElapsedTime int       `json:"elapsed_time"`
+	Gain        float64   `json:"total_elevation_gain"`
 }
 
 func (s *SummaryActivity) MsgFormat(user string) string {
@@ -581,9 +582,19 @@ func (s *SummaryActivity) MsgFormat(user string) string {
 	elapsedTime := calcTime(s.ElapsedTime)
 	racePace := calcPace(miles, float64(s.ElapsedTime))
 	movingPace := calcPace(miles, float64(s.MovingTime))
-
 	pause := time.Duration(time.Duration(s.ElapsedTime-s.MovingTime) * time.Second)
-	return fmt.Sprintf("*%s* %s *%s*: %0.1fmi in %s (%s pace, %s without %s of pause time)", user, emoji(s.Type), s.Name, miles, elapsedTime, racePace, movingPace, pause)
+	gain := s.Gain * 3.28 // meters to feet
+
+	summary := fmt.Sprintf("*%s* %s *%s*: %0.1fmi in %s", user, emoji(s.Type), s.Name, miles, elapsedTime)
+	if gain >= 400 {
+		summary += fmt.Sprintf(", *+%0.0fft*", gain)
+	}
+	summary += fmt.Sprintf(", %s race pace", racePace)
+	if pause >= 60 {
+		summary += fmt.Sprintf(", %s pace without %s pause", movingPace, pause)
+	}
+
+	return summary
 }
 
 func getActivity(client *http.Client, activityID int) (*SummaryActivity, error) {
