@@ -107,8 +107,7 @@ func (s *Server) weatherLoop() {
 				if ws.WeatherChannelID == "" {
 					continue
 				}
-				out := ws.rtm.NewOutgoingMessage(msg, ws.WeatherChannelID)
-				ws.rtm.SendMessage(out)
+				ws.sendMsg(ws.WeatherChannelID, msg)
 			}
 		}
 

@@ -28,6 +28,7 @@ import (
 
 	"github.com/dchest/safefile"
 	"github.com/gorilla/sessions"
+	"github.com/keybase/go-keybase-chat-bot/kbchat"
 	"github.com/nlopes/slack"
 )
 
@@ -39,27 +40,34 @@ type Server struct {
 	stravaConf     *oauth2.Config
 	subscribeToken string
 
-	workspaces map[string]*SlackWorkspace
+	kbAdminUsername string
+	kbc             *kbchat.API
 
-	alertAdmin func(format string, v ...interface{})
+	workspaces map[string]*Workspace
 }
 
 type Config struct {
-	Hostname string
+	Hostname        string
+	KBAdminUsername string
 
 	StravaClientID     string
 	StravaClientSecret string
 
-	SlackWorkspaces map[string]*SlackWorkspace
+	Workspaces map[string]*Workspace
 }
 
-type SlackWorkspace struct {
-	APIToken         string
-	AdminChannelID   string
+type Workspace struct {
+	Type string // "slack" or "keybase"
+	Name string // Team name for Keybase
+
 	RunningChannelID string
 	WeatherChannelID string
 
-	rtm *slack.RTM
+	// APIToken is used by Slack workspaces
+	APIToken string
+	rtm      *slack.RTM
+
+	kbc *kbchat.API
 }
 
 var store *sessions.CookieStore
@@ -86,8 +94,13 @@ func main() {
 	if err := json.Unmarshal(confData, conf); err != nil {
 		log.Fatalf("error parsing config.json: %s", err)
 	}
-	if conf.Hostname == "" || conf.StravaClientID == "" || conf.StravaClientSecret == "" || len(conf.SlackWorkspaces) == 0 {
+	if conf.Hostname == "" || conf.KBAdminUsername == "" || conf.StravaClientID == "" || conf.StravaClientSecret == "" || len(conf.Workspaces) == 0 {
 		log.Fatalf("invalid config file (some fields missing)")
+	}
+
+	kbc, err := kbchat.Start(kbchat.RunOptions{})
+	if err != nil {
+		log.Fatalf("error creating keybase API: %s", err.Error())
 	}
 
 	s := &Server{
@@ -106,29 +119,28 @@ func main() {
 
 		subscribeToken: randomString(),
 
-		workspaces: conf.SlackWorkspaces,
-		alertAdmin: func(format string, v ...interface{}) { log.Printf(format, v...) },
+		kbc:             kbc,
+		kbAdminUsername: conf.KBAdminUsername,
+
+		workspaces: conf.Workspaces,
 	}
 
-	for name, ws := range conf.SlackWorkspaces {
-		logFile := logFile(fmt.Sprintf("slack-%s.log", name))
-		defer logFile.Close()
-		slackLog := log.New(logFile, "", log.Lshortfile|log.LstdFlags)
+	for name, ws := range conf.Workspaces {
+		ws.Name = name
+		switch ws.Type {
+		case "slack":
+			logFile := logFile(fmt.Sprintf("slack-%s.log", name))
+			defer logFile.Close()
+			slackLog := log.New(logFile, "", log.Lshortfile|log.LstdFlags)
 
-		api := slack.New(ws.APIToken, slack.OptionDebug(true), slack.OptionLog(slackLog))
-		ws.rtm = api.NewRTM()
-		go ws.rtm.ManageConnection()
-		go s.messageLoop(name, ws)
-
-		if ws.AdminChannelID != "" {
-			ws := ws
-			// Send admin alerts to only one channel.
-			s.alertAdmin = func(format string, v ...interface{}) {
-				str := fmt.Sprintf(format, v...)
-				log.Println(str)
-				msg := ws.rtm.NewOutgoingMessage(str, ws.AdminChannelID)
-				ws.rtm.SendMessage(msg)
-			}
+			api := slack.New(ws.APIToken, slack.OptionDebug(true), slack.OptionLog(slackLog))
+			ws.rtm = api.NewRTM()
+			go ws.rtm.ManageConnection()
+			go s.slackMessageLoop(ws)
+		case "keybase":
+			ws.kbc = kbc
+		default:
+			log.Fatalf("unknown workspace type: %q", ws.Type)
 		}
 	}
 
@@ -167,17 +179,80 @@ func main() {
 	s.loadUsers()
 	s.subscribeWebhook()
 
+	go s.keybaseMessageLoop()
 	go s.weatherLoop()
+
+	s.alertAdmin("Bot online: %s", conf.Hostname)
 
 	select {}
 }
 
-func (s *Server) messageLoop(name string, ws *SlackWorkspace) {
+func (s *Server) alertAdmin(format string, v ...interface{}) {
+	str := fmt.Sprintf(format, v...)
+	log.Println(str)
+	tlfName := fmt.Sprintf("%s,%s", s.kbc.GetUsername(), s.kbAdminUsername)
+	if _, err := s.kbc.SendMessageByTlfName(tlfName, str); err != nil {
+		log.Printf("error sending keybase admin message: %s", err)
+	}
+}
+
+func (ws *Workspace) sendMsg(dst string, msg string) {
+	if ws.Type == "slack" {
+		m := ws.rtm.NewOutgoingMessage(msg, dst)
+		ws.rtm.SendMessage(m)
+	}
+	if ws.Type == "keybase" {
+		if _, err := ws.kbc.SendMessageByTeamName(ws.Name, &dst, msg); err != nil {
+			log.Printf("error sending keybase message to %q: %s", dst, err)
+		}
+	}
+}
+
+func (s *Server) keybaseMessageLoop() {
+	sub, err := s.kbc.ListenForNewTextMessages()
+	if err != nil {
+		log.Fatalf("error listening for keybase messages: %s", err.Error())
+	}
+
+	for {
+		msg, err := sub.Read()
+		if err != nil {
+			log.Fatalf("failed to read keybase message: %s", err.Error())
+		}
+
+		if msg.Message.Content.TypeName != "text" {
+			continue
+		}
+		if msg.Message.Sender.Username == s.kbc.GetUsername() {
+			continue
+		}
+
+		if msg.Message.Content.Text.Body == "!testrun" {
+			for wsName, ws := range s.workspaces {
+				if ws.Type != "keybase" {
+					continue
+				}
+				ws.sendMsg(ws.RunningChannelID, "test run for workspace "+wsName)
+			}
+		}
+		if msg.Message.Content.Text.Body == "!hsf" {
+			outlook, err := getOutlook()
+			if err != nil {
+				continue
+			}
+			f := outlook.SummitOutlook.Forecast1
+			str := fmt.Sprintf("Higher summits forecast for %s:  %s -- wind %s -- chill %s", f.Period, f.Prediction.Temperature, f.Prediction.Wind, f.Prediction.WindChill)
+			s.kbc.SendMessage(msg.Message.Channel, str)
+		}
+	}
+}
+
+func (s *Server) slackMessageLoop(ws *Workspace) {
 	for msg := range ws.rtm.IncomingEvents {
 		switch ev := msg.Data.(type) {
 		case *slack.MessageEvent:
 			if ev.Text == "!follow" {
-				text := fmt.Sprintf("https://%s/strava/follow?workspace=%s", s.hostname, name)
+				text := fmt.Sprintf("https://%s/strava/follow?workspace=%s", s.hostname, ws.Name)
 				msg := ws.rtm.NewOutgoingMessage(text, ev.Channel)
 				ws.rtm.SendMessage(msg)
 			}
@@ -200,17 +275,20 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) stravaFollowHandler(w http.ResponseWriter, r *http.Request) {
+	session, _ := store.Get(r, "strava")
+
 	workspace := r.URL.Query().Get("workspace")
-	_, ok := s.workspaces[workspace]
-	if !ok {
-		http.Error(w, fmt.Sprintf("unknown slack workspace: %q", workspace), http.StatusBadRequest)
-		return
+	if workspace != "" {
+		_, ok := s.workspaces[workspace]
+		if !ok {
+			http.Error(w, fmt.Sprintf("unknown workspace: %q", workspace), http.StatusBadRequest)
+			return
+		}
+		session.Values["workspace"] = workspace
 	}
 
-	session, _ := store.Get(r, "strava")
 	oauthState := randomString()
 	session.Values["oauth-state"] = oauthState
-	session.Values["workspace"] = workspace
 	session.Save(r, w)
 
 	authURL := s.stravaConf.AuthCodeURL(oauthState, oauth2.AccessTypeOffline)
@@ -250,7 +328,7 @@ type StravaUser struct {
 	Name  string
 	Token *oauth2.Token
 
-	SlackWorkspaces []string
+	Workspaces []string
 }
 
 func (s *Server) loadStravaUser(id int) (*StravaUser, error) {
@@ -296,7 +374,7 @@ var userTemplate = template.Must(template.New("user").Parse(`<!doctype html>
   <label>Strava ID: <input type="text" value="{{.ID}}" readonly></label><br>
   <label>Name: <input type="text" value="{{.Name}}" readonly></label><br>
   <fieldset>
-    <legend>Post runs to these Slacks:</legend>
+    <legend>Post runs to these workspaces:</legend>
 	{{range $name, $checked := .Workspaces}}
 	<label><input name="workspaces" value="{{$name}}" type="checkbox"{{if $checked}}checked{{end}}> {{$name}}</label>
 	{{end}}
@@ -336,7 +414,7 @@ func (s *Server) stravaUserHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		u, err := s.loadStravaUser(athlete.ID)
 		if err == nil {
-			for _, name := range u.SlackWorkspaces {
+			for _, name := range u.Workspaces {
 				td.Workspaces[name] = true
 			}
 		}
@@ -358,10 +436,10 @@ func (s *Server) stravaUserHandler(w http.ResponseWriter, r *http.Request) {
 			td.Workspaces[name] = true
 		}
 		u := &StravaUser{
-			ID:              athlete.ID,
-			Name:            athlete.FirstName,
-			Token:           token,
-			SlackWorkspaces: names,
+			ID:         athlete.ID,
+			Name:       athlete.FirstName,
+			Token:      token,
+			Workspaces: names,
 		}
 		err := u.Save()
 		if err != nil {
@@ -370,7 +448,7 @@ func (s *Server) stravaUserHandler(w http.ResponseWriter, r *http.Request) {
 			log.Println(errmsg)
 		} else {
 			td.Message = fmt.Sprintf("Saved settings for user %d", athlete.ID)
-			s.alertAdmin("Updated Strava user settings for %s (%d): %v", u.Name, u.ID, u.SlackWorkspaces)
+			s.alertAdmin("Updated Strava user settings for %s (%d): %v", u.Name, u.ID, u.Workspaces)
 		}
 	}
 
@@ -475,13 +553,12 @@ func (s *Server) stravaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 			if event.AspectType != "create" {
 				msg = msg + "  _(" + event.AspectType + ")_"
 			}
-			for _, name := range u.SlackWorkspaces {
+			for _, name := range u.Workspaces {
 				ws, ok := s.workspaces[name]
 				if !ok {
 					continue
 				}
-				out := ws.rtm.NewOutgoingMessage(msg, ws.RunningChannelID)
-				ws.rtm.SendMessage(out)
+				ws.sendMsg(ws.RunningChannelID, msg)
 			}
 		}()
 	}
