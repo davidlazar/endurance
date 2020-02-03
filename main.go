@@ -217,7 +217,11 @@ func (s *Server) keybaseMessageLoop() {
 	for {
 		msg, err := sub.Read()
 		if err != nil {
-			log.Fatalf("failed to read keybase message: %s", err.Error())
+			err := fmt.Errorf("failed to read keybase message: %s", err.Error())
+			log.Println(err)
+			s.alertAdmin("%s", err)
+			time.Sleep(2 * time.Second)
+			continue
 		}
 
 		if msg.Message.Content.TypeName != "text" {
