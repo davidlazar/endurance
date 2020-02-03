@@ -626,9 +626,37 @@ func getActivity(client *http.Client, activityID int) (*SummaryActivity, error) 
 	return activity, nil
 }
 
+func (s *Server) existingSubscription() bool {
+	u := fmt.Sprintf("%s/push_subscriptions?client_id=%s&client_secret=%s", apiRoot, s.stravaConf.ClientID, s.stravaConf.ClientSecret)
+	resp, err := http.Get(u)
+	if err != nil {
+		log.Fatalf("GET strava /push_subscriptions: %s", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalf("failed to read push_subscriptions body: %s", err)
+	}
+	var subs []map[string]interface{}
+	if err := json.Unmarshal(body, &subs); err != nil {
+		log.Fatalln(err)
+	}
+	if len(subs) == 0 {
+		return false
+	}
+	if subs[0]["callback_url"] == "https://"+s.hostname+"/strava/webhook" {
+		return true
+	}
+	return false
+}
+
 func (s *Server) subscribeWebhook() {
-	// NOTE: This URL is different from the API root used elsewhere.
-	resp, err := http.PostForm("https://api.strava.com/api/v3/push_subscriptions", url.Values{
+	if s.existingSubscription() {
+		return
+	}
+
+	resp, err := http.PostForm(apiRoot+"/push_subscriptions", url.Values{
 		"client_id":     {s.stravaConf.ClientID},
 		"client_secret": {s.stravaConf.ClientSecret},
 		"callback_url":  {"https://" + s.hostname + "/strava/webhook"},
