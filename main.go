@@ -231,15 +231,18 @@ func (s *Server) keybaseMessageLoop() {
 			continue
 		}
 
-		if msg.Message.Content.Text.Body == "!testrun" {
-			for wsName, ws := range s.workspaces {
-				if ws.Type != "keybase" {
-					continue
-				}
-				ws.sendMsg(ws.RunningChannelID, "test run for workspace "+wsName)
+		text := msg.Message.Content.Text.Body
+		if strings.HasPrefix(text, "!testrun ") {
+			target := strings.TrimPrefix(text, "!testrun ")
+			ws, ok := s.workspaces[target]
+			if !ok {
+				s.kbc.SendMessage(msg.Message.Channel, "workspace %q not found", target)
+				continue
 			}
+			ws.sendMsg(ws.RunningChannelID, "test run for workspace "+target)
 		}
-		if msg.Message.Content.Text.Body == "!hsf" {
+
+		if text == "!hsf" {
 			outlook, err := getOutlook()
 			if err != nil {
 				continue
