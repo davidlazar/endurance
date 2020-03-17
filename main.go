@@ -751,8 +751,22 @@ func emoji(activityType string) string {
 		return "🚶"
 	case "Swim":
 		return "🏊"
+	case "AlpineSki":
+		return "⛷️"
+	case "BackcountrySki":
+		return "🎿️"
+	case "Snowboard":
+		return "🏂"
+	case "IceSkate":
+		return "⛸"
+	case "RockClimbing":
+		return "🧗"
+	case "Soccer":
+		return "⚽"
+	case "Yoga":
+		return "🧘"
 	}
-	return "🤸" + activityType
+	return "🤸(" + activityType + ")"
 }
 
 func randomString() string {
