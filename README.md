@@ -1,6 +1,6 @@
 # Endurance
 
-Endurance is a bot that posts your runs, hikes, swims, and bike rides to Slack:
+Endurance is a bot that posts your Strava activities to Slack or Keybase:
 
 ![Endurance screenshot](screenshot.png)
 
