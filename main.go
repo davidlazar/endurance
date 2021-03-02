@@ -574,31 +574,46 @@ func (s *Server) stravaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type SummaryActivity struct {
-	ID          int       `json:"id"`
-	Type        string    `json:"type"`
-	Name        string    `json:"name"`
-	StartDate   time.Time `json:"start_date"`
-	Distance    float64   `json:"distance"`
-	MovingTime  int       `json:"moving_time"`
-	ElapsedTime int       `json:"elapsed_time"`
-	Gain        float64   `json:"total_elevation_gain"`
+	ID           int       `json:"id"`
+	Type         string    `json:"type"`
+	Name         string    `json:"name"`
+	StartDate    time.Time `json:"start_date"`
+	Distance     float64   `json:"distance"`
+	MovingTime   int       `json:"moving_time"`
+	ElapsedTime  int       `json:"elapsed_time"`
+	Gain         float64   `json:"total_elevation_gain"`
+	AverageSpeed float64   `json:"average_speed"` // meters per second
+	MaxSpeed     float64   `json:"max_speed"`     // meters per second
 }
 
 func (s *SummaryActivity) MsgFormat(user string) string {
 	miles := s.Distance / 1609.34 // meters in a mile
-	elapsedTime := calcTime(s.ElapsedTime)
+	movingTime := calcTime(s.MovingTime)
 	racePace := calcPace(miles, float64(s.ElapsedTime))
 	movingPace := calcPace(miles, float64(s.MovingTime))
 	pause := time.Duration(time.Duration(s.ElapsedTime-s.MovingTime) * time.Second)
-	gain := s.Gain * 3.28 // meters to feet
+	gain := s.Gain * 3.281 // meters to feet
 
-	summary := fmt.Sprintf("*%s* %s *%s*: %0.1fmi in %s", user, emoji(s.Type), s.Name, miles, elapsedTime)
+	summary := fmt.Sprintf("*%s* %s *%s*: %0.1f mi in %s", user, emoji(s.Type), s.Name, miles, movingTime)
 	if gain >= 400 {
-		summary += fmt.Sprintf(", *+%0.0fft*", gain)
+		summary += fmt.Sprintf(", *+%0.0f* ft", gain)
 	}
-	summary += fmt.Sprintf(", %s race pace", racePace)
-	if pause >= 60 {
-		summary += fmt.Sprintf(", %s pace without %s pause", movingPace, pause)
+
+	if s.Type == "Ride" || s.Type == "AlpineSki" {
+		mph := 2.23694
+		avg := s.AverageSpeed * mph
+		top := s.MaxSpeed * mph
+		summary += fmt.Sprintf(", %0.1f mph avg, %0.1f mph top", avg, top)
+
+		return summary
+	}
+
+	summary += fmt.Sprintf(", %s pace", movingPace)
+	if pause > 120*time.Second {
+		summary += fmt.Sprintf(", %s pause", pause)
+		if s.Type == "Run" {
+			summary += fmt.Sprintf(", %s race pace", racePace)
+		}
 	}
 
 	return summary
