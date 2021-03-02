@@ -19,3 +19,5 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b // indirect
 )
+
+replace github.com/keybase/go-keybase-chat-bot => github.com/davidlazar/go-keybase-chat-bot v0.0.0-20210302191849-2e009342c3b7

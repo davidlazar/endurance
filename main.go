@@ -21,8 +21,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/keybase/go-keybase-chat-bot/kbchat/types/chat1"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/oauth2"
 
@@ -67,7 +69,9 @@ type Workspace struct {
 	APIToken string
 	rtm      *slack.RTM
 
-	kbc *kbchat.API
+	kbc              *kbchat.API
+	mu               sync.Mutex
+	kbcActivityCache map[int]chat1.MessageID
 }
 
 var store *sessions.CookieStore
@@ -557,15 +561,43 @@ func (s *Server) stravaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			msg := activity.MsgFormat(athlete.FirstName)
-			if event.AspectType != "create" {
-				msg = msg + "  _(" + event.AspectType + ")_"
-			}
 			for _, name := range u.Workspaces {
 				ws, ok := s.workspaces[name]
 				if !ok {
 					continue
 				}
-				ws.sendMsg(ws.RunningChannelID, msg)
+				if ws.Type == "slack" {
+					m := ws.rtm.NewOutgoingMessage(msg, ws.RunningChannelID)
+					ws.rtm.SendMessage(m)
+				}
+				if ws.Type == "keybase" {
+					ws.mu.Lock()
+					msgID, ok := ws.kbcActivityCache[activity.ID]
+					ws.mu.Unlock()
+					if ok {
+						channel := chat1.ChatChannel{
+							Name:        ws.Name,
+							MembersType: "team",
+							TopicName:   ws.RunningChannelID,
+						}
+						_, err := ws.kbc.EditByChannel(channel, msgID, msg)
+						if err != nil {
+							log.Printf("error editing keybase message in workspace %s: %s", ws.Name, err)
+						}
+					} else {
+						resp, err := ws.kbc.SendMessageByTeamName(ws.Name, &ws.RunningChannelID, msg)
+						if err != nil {
+							log.Printf("error sending keybase message to %q: %s", ws.RunningChannelID, err)
+						} else {
+							ws.mu.Lock()
+							if ws.kbcActivityCache == nil {
+								ws.kbcActivityCache = make(map[int]chat1.MessageID)
+							}
+							ws.kbcActivityCache[activity.ID] = *resp.Result.MessageID
+							ws.mu.Unlock()
+						}
+					}
+				}
 			}
 		}()
 	}
