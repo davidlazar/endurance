@@ -754,14 +754,13 @@ func emoji(activityType string) string {
 	case "AlpineSki":
 		return "⛷️"
 	case "BackcountrySki":
-		return "🎿️"
+		return "🏔️⛷️"
 	case "Snowboard":
 		return "🏂"
 	case "IceSkate":
 		return "⛸"
-	// Emoji coming in second half of 2020: https://emojipedia.org/roller-skate/
 	case "InlineSkate":
-		return "🌞⛸"
+		return "🛼"
 	case "Kayaking":
 		return "🚣"
 	case "RockClimbing":
